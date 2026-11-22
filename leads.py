@@ -113,8 +113,17 @@ class LeadDetails(BaseModel):
 # ----------------------------------------------------------------------------
 # Stage 1: discover businesses on OpenStreetMap
 # ----------------------------------------------------------------------------
-def geocode_city(city: str, session: requests.Session) -> tuple[float, ...] | None:
-    """Return (south, west, north, east) for a "City,CC" string via Nominatim."""
+GEOCODE_CACHE = Path(__file__).with_name("geocache.json")
+
+
+def geocode_city(city: str, session: requests.Session) -> tuple[float, float] | None:
+    """Return the (lat, lon) centre of a "City,CC" string via Nominatim.
+
+    Results are cached in geocache.json so each city is looked up only once.
+    """
+    cache = json.loads(GEOCODE_CACHE.read_text()) if GEOCODE_CACHE.exists() else {}
+    if city in cache:
+        return tuple(cache[city]) if cache[city] else None
     name, _, country = city.partition(",")
     params = {"city": name.strip(), "format": "json", "limit": 1}
     if country.strip():
@@ -123,10 +132,10 @@ def geocode_city(city: str, session: requests.Session) -> tuple[float, ...] | No
     resp.raise_for_status()
     time.sleep(1.1)  # Nominatim usage policy: max 1 request per second
     data = resp.json()
-    if not data:
-        return None
-    s, n, w, e = (float(x) for x in data[0]["boundingbox"])
-    return (s, w, n, e)
+    point = (float(data[0]["lat"]), float(data[0]["lon"])) if data else None
+    cache[city] = point
+    GEOCODE_CACHE.write_text(json.dumps(cache, indent=1))
+    return point
 
 
 def overpass_query(query: str, session: requests.Session, rounds: int = 2) -> dict:
@@ -154,35 +163,40 @@ def overpass_query(query: str, session: requests.Session, rounds: int = 2) -> di
     raise RuntimeError(f"All Overpass servers failed: {last_err}")
 
 
-def _category_query(category: str, bbox_s: str, limit: int) -> str:
+def _category_query(category: str, area: str, limit: int) -> str:
     """Overpass query for one category, returning at most ``limit`` elements."""
     selectors = "".join(
-        f'nwr["{k}"="{v}"]["website"]({bbox_s});'
-        f'nwr["{k}"="{v}"]["contact:website"]({bbox_s});'
+        f'nwr["{k}"="{v}"]["website"]({area});'
+        f'nwr["{k}"="{v}"]["contact:website"]({area});'
         for k, v in CATEGORIES[category]
     )
     return f"[out:json][timeout:120];({selectors});out center tags {limit};"
 
 
 def discover(
-    city: str, categories: list[str], max_results: int, session: requests.Session
+    city: str,
+    categories: list[str],
+    max_results: int,
+    session: requests.Session,
+    radius_km: float = 8.0,
 ) -> list[dict]:
     """Return businesses with a website in one city, for all given categories.
 
-    The city is geocoded once, then each category is queried separately with an
+    The search covers ``radius_km`` around the city centre (a whole city's
+    boundary is too big for the public servers). Each category is queried with an
     output limit, which keeps each request small enough for the public Overpass
     servers. At most ``max_results`` leads are kept per category. A category whose
     query fails is logged and skipped; the others still return.
     """
-    bbox = geocode_city(city, session)
-    if bbox is None:
+    point = geocode_city(city, session)
+    if point is None:
         log.warning("Could not geocode %s, skipping", city)
         return []
-    bbox_s = ",".join(f"{x:.5f}" for x in bbox)
+    area = f"around:{radius_km * 1000:.0f},{point[0]:.5f},{point[1]:.5f}"
     elements = []
     for category in categories:
         # Ask for extra rows: some lack a name and are dropped below.
-        query = _category_query(category, bbox_s, max_results * 2)
+        query = _category_query(category, area, max_results * 2)
         try:
             elements.extend(overpass_query(query, session).get("elements", []))
         except RuntimeError as err:
@@ -333,6 +347,8 @@ def main() -> int:
     parser.add_argument("--cities", nargs="+", default=DEFAULT_CITIES)
     parser.add_argument("--max-per-city", type=int, default=15,
                         help="max leads per city per category (default 15)")
+    parser.add_argument("--radius-km", type=float, default=8.0,
+                        help="search radius around each city centre (default 8)")
     parser.add_argument("--output", default="leads.csv")
     parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", "llama3.2:3b"))
     parser.add_argument("--num-ctx", type=int, default=8192)
@@ -372,7 +388,9 @@ def main() -> int:
 
     for city in args.cities:
         try:
-            leads = discover(city, args.categories, args.max_per_city, session)
+            leads = discover(
+                city, args.categories, args.max_per_city, session, args.radius_km
+            )
         except Exception as err:
             log.error("Discovery failed for %s: %s", city, err)
             continue

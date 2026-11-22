@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 .env
 run.log
+geocache.json
+run_*.log

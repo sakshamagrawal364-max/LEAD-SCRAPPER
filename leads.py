@@ -148,9 +148,14 @@ def overpass_query(query: str, session: requests.Session) -> dict:
 
 
 def discover(
-    city: str, category: str, max_results: int, session: requests.Session
+    city: str, categories: list[str], max_results: int, session: requests.Session
 ) -> list[dict]:
-    """Return businesses with a website in one city and category."""
+    """Return businesses with a website in one city, for all given categories.
+
+    One Overpass query per city covers every category; each result is assigned
+    to the first category whose tags it matches. At most ``max_results`` leads
+    are kept per category.
+    """
     bbox = geocode_city(city, session)
     if bbox is None:
         log.warning("Could not geocode %s, skipping", city)
@@ -159,17 +164,29 @@ def discover(
     selectors = "".join(
         f'nwr["{k}"="{v}"]["website"]({bbox_s});'
         f'nwr["{k}"="{v}"]["contact:website"]({bbox_s});'
+        for category in categories
         for k, v in CATEGORIES[category]
     )
     query = f"[out:json][timeout:180];({selectors});out center tags;"
     data = overpass_query(query, session)
 
     leads = []
+    per_category: dict[str, int] = dict.fromkeys(categories, 0)
     for el in data.get("elements", []):
         tags = el.get("tags", {})
+        category = next(
+            (
+                c
+                for c in categories
+                if any(tags.get(k) == v for k, v in CATEGORIES[c])
+            ),
+            None,
+        )
         website = tags.get("website") or tags.get("contact:website") or ""
         name = tags.get("name", "")
-        if not website or not name:
+        if category is None or not website or not name:
+            continue
+        if per_category[category] >= max_results:
             continue
         if not website.startswith(("http://", "https://")):
             website = "https://" + website
@@ -198,8 +215,7 @@ def discover(
                 "enriched": "no",
             }
         )
-        if len(leads) >= max_results:
-            break
+        per_category[category] += 1
     return leads
 
 
@@ -331,27 +347,25 @@ def main() -> int:
     written = 0
 
     for city in args.cities:
-        for category in args.categories:
-            try:
-                leads = discover(city, category, args.max_per_city, session)
-            except Exception as err:
-                log.error("Discovery failed for %s / %s: %s", city, category, err)
+        try:
+            leads = discover(city, args.categories, args.max_per_city, session)
+        except Exception as err:
+            log.error("Discovery failed for %s: %s", city, err)
+            continue
+        log.info("%s: %d businesses with a website", city, len(leads))
+        for lead in leads:
+            key = lead["website"].rstrip("/").lower()
+            if key in done:
                 continue
-            log.info("%s / %s: %d businesses with a website", city, category,
-                     len(leads))
-            for lead in leads:
-                key = lead["website"].rstrip("/").lower()
-                if key in done:
-                    continue
-                if not args.no_enrich:
-                    lead = enrich(lead, graph_config)
-                    time.sleep(args.delay)
-                append_row(output, lead)
-                done.add(key)
-                written += 1
-                log.info("[%d] %s | %s | %s", written, lead["name"],
-                         lead["email"] or "-", lead["website"])
-            time.sleep(2)  # be gentle with Overpass between queries
+            if not args.no_enrich:
+                lead = enrich(lead, graph_config)
+                time.sleep(args.delay)
+            append_row(output, lead)
+            done.add(key)
+            written += 1
+            log.info("[%d] %s | %s | %s | %s", written, lead["category"],
+                     lead["name"], lead["email"] or "-", lead["website"])
+        time.sleep(2)  # be gentle with Overpass between queries
 
     log.info("Done: %d new leads written to %s", written, output.resolve())
     return 0

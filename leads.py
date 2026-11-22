@@ -129,22 +129,39 @@ def geocode_city(city: str, session: requests.Session) -> tuple[float, ...] | No
     return (s, w, n, e)
 
 
-def overpass_query(query: str, session: requests.Session) -> dict:
-    """Run an Overpass query, trying each public server in turn."""
+def overpass_query(query: str, session: requests.Session, rounds: int = 2) -> dict:
+    """Run an Overpass query, trying each public server in turn.
+
+    Public servers are often overloaded, so the whole list is tried ``rounds``
+    times with a pause in between before giving up.
+    """
     last_err: Exception | None = None
-    for url in OVERPASS_URLS:
-        try:
-            resp = session.post(url, data={"data": query}, timeout=200)
-            if resp.status_code == 429:
-                log.warning("Overpass rate limit at %s, waiting 30 s", url)
-                time.sleep(30)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.RequestException, ValueError) as err:
-            log.warning("Overpass server %s failed: %s", url, err)
-            last_err = err
+    for attempt in range(rounds):
+        if attempt:
+            log.info("All Overpass servers busy, retrying in 30 s")
+            time.sleep(30)
+        for url in OVERPASS_URLS:
+            try:
+                resp = session.post(url, data={"data": query}, timeout=200)
+                if resp.status_code == 429:
+                    log.warning("Overpass rate limit at %s", url)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.RequestException, ValueError) as err:
+                log.warning("Overpass server %s failed: %s", url, err)
+                last_err = err
     raise RuntimeError(f"All Overpass servers failed: {last_err}")
+
+
+def _category_query(category: str, bbox_s: str, limit: int) -> str:
+    """Overpass query for one category, returning at most ``limit`` elements."""
+    selectors = "".join(
+        f'nwr["{k}"="{v}"]["website"]({bbox_s});'
+        f'nwr["{k}"="{v}"]["contact:website"]({bbox_s});'
+        for k, v in CATEGORIES[category]
+    )
+    return f"[out:json][timeout:120];({selectors});out center tags {limit};"
 
 
 def discover(
@@ -152,27 +169,34 @@ def discover(
 ) -> list[dict]:
     """Return businesses with a website in one city, for all given categories.
 
-    One Overpass query per city covers every category; each result is assigned
-    to the first category whose tags it matches. At most ``max_results`` leads
-    are kept per category.
+    The city is geocoded once, then each category is queried separately with an
+    output limit, which keeps each request small enough for the public Overpass
+    servers. At most ``max_results`` leads are kept per category. A category whose
+    query fails is logged and skipped; the others still return.
     """
     bbox = geocode_city(city, session)
     if bbox is None:
         log.warning("Could not geocode %s, skipping", city)
         return []
     bbox_s = ",".join(f"{x:.5f}" for x in bbox)
-    selectors = "".join(
-        f'nwr["{k}"="{v}"]["website"]({bbox_s});'
-        f'nwr["{k}"="{v}"]["contact:website"]({bbox_s});'
-        for category in categories
-        for k, v in CATEGORIES[category]
-    )
-    query = f"[out:json][timeout:180];({selectors});out center tags;"
-    data = overpass_query(query, session)
+    elements = []
+    for category in categories:
+        # Ask for extra rows: some lack a name and are dropped below.
+        query = _category_query(category, bbox_s, max_results * 2)
+        try:
+            elements.extend(overpass_query(query, session).get("elements", []))
+        except RuntimeError as err:
+            log.error("Discovery failed for %s / %s: %s", city, category, err)
+        time.sleep(2)  # be gentle with Overpass between queries
+    data = {"elements": elements}
 
     leads = []
     per_category: dict[str, int] = dict.fromkeys(categories, 0)
+    seen: set[tuple[str, int]] = set()
     for el in data.get("elements", []):
+        if (el["type"], el["id"]) in seen:
+            continue
+        seen.add((el["type"], el["id"]))
         tags = el.get("tags", {})
         category = next(
             (
@@ -365,7 +389,6 @@ def main() -> int:
             written += 1
             log.info("[%d] %s | %s | %s | %s", written, lead["category"],
                      lead["name"], lead["email"] or "-", lead["website"])
-        time.sleep(2)  # be gentle with Overpass between queries
 
     log.info("Done: %d new leads written to %s", written, output.resolve())
     return 0
